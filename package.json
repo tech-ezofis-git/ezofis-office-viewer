@@ -1,0 +1,17 @@
+{
+  "name": "ezofis-office-viewer-wopi",
+  "version": "1.0.0",
+  "description": "WOPI host API for Collabora Online (Azure Blob storage backend)",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@azure/storage-blob": "^12.24.0",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
