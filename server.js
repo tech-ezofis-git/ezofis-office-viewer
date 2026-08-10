@@ -107,6 +107,26 @@ app.get('/', (req, res) => {
   res.json({ service: 'ezofis-office-viewer-wopi', status: 'ok' });
 });
 
+// ---------- Collabora proxies (convenience: same endpoints as the Collabora host) ----------
+
+app.get('/hosting/capabilities', async (req, res) => {
+  try {
+    const resp = await fetch(`${COLLABORA_BASE_URL}/hosting/capabilities`);
+    res.status(resp.status).type('application/json').send(await resp.text());
+  } catch (err) {
+    res.status(502).json({ error: `Collabora unreachable: ${err.message}` });
+  }
+});
+
+app.get('/hosting/discovery', async (req, res) => {
+  try {
+    const resp = await fetch(`${COLLABORA_BASE_URL}/hosting/discovery`);
+    res.status(resp.status).type('text/xml').send(await resp.text());
+  } catch (err) {
+    res.status(502).json({ error: `Collabora unreachable: ${err.message}` });
+  }
+});
+
 // ---------- file management (called by your app) ----------
 
 // Upload a document. Returns the file id, WOPI URL and a ready-to-use editor URL.
