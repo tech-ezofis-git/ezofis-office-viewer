@@ -12,6 +12,6 @@
   "dependencies": {
     "@azure/storage-blob": "^12.24.0",
     "express": "^4.19.2",
-    "multer": "^1.4.5-lts.1"
+    "multer": "^2.2.0"
   }
 }
