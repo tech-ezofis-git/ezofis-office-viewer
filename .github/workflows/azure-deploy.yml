@@ -4,10 +4,16 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'WOPI/**'
+      - '.github/workflows/azure-deploy.yml'
   workflow_dispatch:
 
+env:
+  AZURE_WEBAPP_NAME: ez-officeviewer-wopi
+
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,13 +22,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: npm
+          cache-dependency-path: WOPI/package-lock.json
 
       - name: Install dependencies
-        run: npm install --omit=dev
+        working-directory: WOPI
+        run: |
+          if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: ez-officeviewer-wopi
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          package: .
+          package: WOPI
