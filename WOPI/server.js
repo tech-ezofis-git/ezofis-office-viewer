@@ -1,284 +1,570 @@
-const crypto = require('crypto');
-const express = require('express');
-const multer = require('multer');
-const { BlobServiceClient } = require('@azure/storage-blob');
+/**
+ * WOPI host + PDF editing workflow for Collabora Online CODE.
+ *
+ * Flow for PDFs:
+ *   upload .pdf  ->  convert to .odg (Collabora Conversion API)
+ *                ->  open the .odg in Collabora over WOPI (fully editable)
+ *                ->  on save, write the .odg and regenerate a .pdf in the background
+ *                ->  frontend downloads the regenerated .pdf
+ *
+ * Non-PDF files (docx, xlsx, pptx, odt...) pass straight through, unchanged.
+ *
+ * Requires Node 18+ (global fetch, FormData, Blob).
+ * DEV ONLY: in-memory registry, no real auth, no locking.
+ */
 
-const PORT = process.env.PORT || 8080;
-const STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING;
-const STORAGE_CONTAINER = process.env.AZURE_STORAGE_CONTAINER || 'ez-documents';
-const TOKEN_SECRET = process.env.WOPI_TOKEN_SECRET || 'dev-secret-change-me';
-const TOKEN_TTL_MS = Number(process.env.WOPI_TOKEN_TTL_MS || 10 * 60 * 60 * 1000); // 10h
-const COLLABORA_BASE_URL =
-  process.env.COLLABORA_BASE_URL ||
-  'https://ez-officeviewer-app.graycoast-78e47e4a.southindia.azurecontainerapps.io';
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ''; // e.g. https://ez-officeviewer-wopi.azurewebsites.net
-
-if (!STORAGE_CONNECTION_STRING) {
-  console.error('AZURE_STORAGE_CONNECTION_STRING is not set');
-  process.exit(1);
-}
-
-const blobService = BlobServiceClient.fromConnectionString(STORAGE_CONNECTION_STRING);
-const container = blobService.getContainerClient(STORAGE_CONTAINER);
+const express = require("express");
+const fs = require("fs");
+const fsp = require("fs/promises");
+const path = require("path");
+const multer = require("multer");
+const cors = require("cors");
+const crypto = require("crypto");
+const { convert } = require("./lib/converter");
 
 const app = express();
-app.disable('x-powered-by');
+app.use(cors());
 
-// Browser-facing endpoints (upload/list/editor-url) may be called cross-origin
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
+
+
+// ---------------------------------------------------------------- config
+
+const PORT = process.env.PORT || 5000;
+const COLLABORA_URL = process.env.COLLABORA_URL ||  "https://ez-officeviewer-app.graycoast-78e47e4a.southindia.azurecontainerapps.io" ||"http://localhost:9980" ||   "https://ez-officeviewer-wopi.azurewebsites.net";
+const POST_MESSAGE_ORIGIN = process.env.APP_ORIGIN || "https://trial.ezofis.com" || "http://localhost:8080" ||"http://localhost:3000" || "https://demoapp.ezofis.com" || "https://v6app.ezofis.com";
+const CONVERT_TIMEOUT_MS = 180_000;   // big/scanned PDFs are slow
+const SAVE_DEBOUNCE_MS = 2_000;       // collapse rapid autosaves into one convert
+
+const UPLOAD_DIR = path.join(__dirname, "storage", "originals");
+const WORK_DIR = path.join(__dirname, "storage", "working");
+const OUTPUT_DIR = path.join(__dirname, "storage", "output");
+
+for (const dir of [UPLOAD_DIR, WORK_DIR, OUTPUT_DIR]) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+// Keep the original extension - Collabora picks its import filter from it.
+const upload1 = multer({
+  storage: multer.diskStorage({
+    destination: UPLOAD_DIR,
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      cb(null, `${crypto.randomUUID()}${ext}`);
+    },
+  }),
+  limits: { fileSize: 100 * 1024 * 1024 },
 });
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
+const STAGING_DIR = path.join(__dirname, "storage", "staging");
+fs.mkdirSync(STAGING_DIR, { recursive: true });
 
-// ---------- access tokens ----------
-
-function signToken(fileId, expiresAt) {
-  const mac = crypto
-    .createHmac('sha256', TOKEN_SECRET)
-    .update(`${fileId}|${expiresAt}`)
-    .digest('base64url');
-  return `${expiresAt}.${mac}`;
-}
-
-function issueToken(fileId) {
-  return signToken(fileId, Date.now() + TOKEN_TTL_MS);
-}
-
-function verifyToken(fileId, token) {
-  if (!token) return false;
-  const dot = token.indexOf('.');
-  if (dot < 0) return false;
-  const expiresAt = Number(token.slice(0, dot));
-  if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return false;
-  const expected = signToken(fileId, expiresAt);
-  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
-}
-
-function requireToken(req, res, next) {
-  const token = req.query.access_token;
-  if (!verifyToken(req.params.id, token)) {
-    return res.status(401).json({ error: 'Invalid or expired access_token' });
-  }
-  next();
-}
-
-// ---------- helpers ----------
-
-function blobFor(fileId) {
-  return container.getBlockBlobClient(fileId);
-}
-
-async function streamToBuffer(stream) {
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return Buffer.concat(chunks);
-}
-
-function baseUrl(req) {
-  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/$/, '');
-  const proto = req.headers['x-forwarded-proto'] || req.protocol;
-  return `${proto}://${req.get('host')}`;
-}
-
-let discoveryCache = { xml: null, fetchedAt: 0 };
-
-async function getEditorUrlSrc(ext) {
-  if (!discoveryCache.xml || Date.now() - discoveryCache.fetchedAt > 60 * 60 * 1000) {
-    const resp = await fetch(`${COLLABORA_BASE_URL}/hosting/discovery`);
-    if (!resp.ok) throw new Error(`discovery fetch failed: ${resp.status}`);
-    discoveryCache = { xml: await resp.text(), fetchedAt: Date.now() };
-  }
-  // Prefer the "edit" action for this extension, fall back to any urlsrc
-  const editRe = new RegExp(`ext="${ext}"[^>]*name="edit"[^>]*urlsrc="([^"]+)"`, 'i');
-  const anyRe = new RegExp(`ext="${ext}"[^>]*urlsrc="([^"]+)"`, 'i');
-  const m = discoveryCache.xml.match(editRe) || discoveryCache.xml.match(anyRe);
-  if (!m) throw new Error(`no Collabora action found for extension .${ext}`);
-  return m[1];
-}
-
-// ---------- health ----------
-
-app.get('/', (req, res) => {
-  res.json({ service: 'ezofis-office-viewer-wopi', status: 'ok' });
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: STAGING_DIR,
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      cb(null, `${crypto.randomUUID()}${ext}`);
+    },
+  }),
+  limits: { fileSize: 100 * 1024 * 1024 },
 });
 
-// ---------- Collabora proxies (convenience: same endpoints as the Collabora host) ----------
+/**
+ * fileRegistry[id] = {
+ *   token,            access token for this file
+ *   kind,             "native" | "pdf-derived"
+ *   originalPath,     path to the file as uploaded (PDF kept immutable)
+ *   originalName,     "invoice.pdf"
+ *   editPath,         what Collabora actually opens (.odg for PDFs)
+ *   editName,         "invoice.odg"  <- drives BaseFileName
+ *   outputPath,       regenerated PDF (pdf-derived only)
+ *   dirty,            edited since last PDF regeneration
+ *   converting,       a regeneration is in flight
+ *   lastError,        last conversion error message, if any
+ * }
+ */
+const fileRegistry = {};
+let fileCounter = 1;
+const saveTimers = new Map();
 
-app.get('/hosting/capabilities', async (req, res) => {
+// ------------------------------------------------------- conversion layer
+
+/**
+ * POST a file to Collabora's documented Conversion API.
+ * Endpoint: POST {collabora}/cool/convert-to/{format}, multipart field "data".
+ * Access is gated by net.post_allow in coolwsd.xml.
+ */
+async function convertDocument(inputPath, targetFormat) {
+  const buffer = await fsp.readFile(inputPath);
+
+  const form = new FormData();
+  // The filename matters: Collabora infers the source filter from its extension.
+  form.append("data", new Blob([buffer]), path.basename(inputPath));
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONVERT_TIMEOUT_MS);
+
   try {
-    const resp = await fetch(`${COLLABORA_BASE_URL}/hosting/capabilities`);
-    res.status(resp.status).type('application/json').send(await resp.text());
-  } catch (err) {
-    res.status(502).json({ error: `Collabora unreachable: ${err.message}` });
-  }
-});
-
-app.get('/hosting/discovery', async (req, res) => {
-  try {
-    const resp = await fetch(`${COLLABORA_BASE_URL}/hosting/discovery`);
-    res.status(resp.status).type('text/xml').send(await resp.text());
-  } catch (err) {
-    res.status(502).json({ error: `Collabora unreachable: ${err.message}` });
-  }
-});
-
-// ---------- file management (called by your app) ----------
-
-// Upload a document. Returns the file id, WOPI URL and a ready-to-use editor URL.
-app.post('/files', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'multipart field "file" is required' });
-    const fileId = crypto.randomUUID();
-    const blob = blobFor(fileId);
-    await blob.uploadData(req.file.buffer, {
-      blobHTTPHeaders: { blobContentType: req.file.mimetype || 'application/octet-stream' },
-      metadata: { filename: encodeURIComponent(req.file.originalname) },
+    const res = await fetch(`${COLLABORA_URL}/cool/convert-to/${targetFormat}`, {
+      method: "POST",
+      body: form,
+      signal: controller.signal,
     });
-    const token = issueToken(fileId);
-    const wopiSrc = `${baseUrl(req)}/wopi/files/${fileId}`;
-    res.status(201).json({
-      fileId,
-      fileName: req.file.originalname,
-      size: req.file.size,
-      wopiSrc,
-      accessToken: token,
-      editorUrl: await buildEditorUrl(req, fileId, req.file.originalname, {}),
-    });
-  } catch (err) {
-    console.error('upload failed', err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
-app.get('/files', async (req, res) => {
-  try {
-    const files = [];
-    for await (const item of container.listBlobsFlat({ includeMetadata: true })) {
-      files.push({
-        fileId: item.name,
-        fileName: decodeURIComponent(item.metadata?.filename || item.name),
-        size: item.properties.contentLength,
-        lastModified: item.properties.lastModified,
-      });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(
+        `convert-to/${targetFormat} returned ${res.status}. ${detail.slice(0, 300)}`
+      );
     }
-    res.json(files);
-  } catch (err) {
-    console.error('list failed', err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
-app.delete('/files/:id', async (req, res) => {
-  try {
-    await blobFor(req.params.id).deleteIfExists();
-    res.json({ deleted: req.params.id });
+    const out = Buffer.from(await res.arrayBuffer());
+    if (out.length === 0) {
+      throw new Error(`convert-to/${targetFormat} returned an empty document.`);
+    }
+    return out;
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (err.name === "AbortError") {
+      throw new Error(`Conversion to ${targetFormat} timed out.`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-});
-
-async function buildEditorUrl(req, fileId, fileName, { permission, origin }) {
-  const ext = (fileName.split('.').pop() || 'docx').toLowerCase();
-  const urlsrc = await getEditorUrlSrc(ext);
-  const wopiSrc = `${baseUrl(req)}/wopi/files/${fileId}`;
-  const params = new URLSearchParams({
-    WOPISrc: wopiSrc,
-    access_token: issueToken(fileId),
-    access_token_ttl: '0',
-  });
-  if (permission) params.set('permission', permission);
-  if (origin) params.set('postMessageOrigin', origin);
-  return `${urlsrc}${params.toString()}`;
 }
 
-// Build the Collabora iframe URL for an existing file.
-// GET /editor-url/:id?permission=readonly&origin=http://localhost:8080
-app.get('/editor-url/:id', async (req, res) => {
+async function regeneratePdf(id) {
+  const file = fileRegistry[id];
+  if (!file || file.kind !== "pdf-derived" || file.converting) return;
+
+  file.converting = true;
   try {
-    const blob = blobFor(req.params.id);
-    const props = await blob.getProperties();
-    const fileName = decodeURIComponent(props.metadata?.filename || req.params.id);
-    const editorUrl = await buildEditorUrl(req, req.params.id, fileName, {
-      permission: req.query.permission,
-      origin: req.query.origin,
-    });
-    res.json({ fileId: req.params.id, fileName, editorUrl });
+    const pdf = await convertDocument(file.editPath, "pdf");
+    await fsp.writeFile(file.outputPath, pdf);
+    file.dirty = false;
+    file.lastError = null;
+    file.updatedAt = new Date().toISOString();
+    console.log(`[convert] regenerated PDF for file ${id}`);
   } catch (err) {
-    if (err.statusCode === 404) return res.status(404).json({ error: 'file not found' });
-    console.error('editor-url failed', err);
-    res.status(500).json({ error: err.message });
+    file.lastError = err.message;
+    console.error(`[convert] PDF regeneration failed for ${id}:`, err.message);
+  } finally {
+    file.converting = false;
   }
-});
+}
 
-// ---------- WOPI protocol (called by Collabora) ----------
+function scheduleRegeneration(id) {
+  clearTimeout(saveTimers.get(id));
+  saveTimers.set(
+    id,
+    setTimeout(() => {
+      saveTimers.delete(id);
+      regeneratePdf(id);
+    }, SAVE_DEBOUNCE_MS)
+  );
+}
 
-// CheckFileInfo
-app.get('/wopi/files/:id', requireToken, async (req, res) => {
-  try {
-    const props = await blobFor(req.params.id).getProperties();
-    const fileName = decodeURIComponent(props.metadata?.filename || req.params.id);
-    res.json({
-      BaseFileName: fileName,
-      Size: props.contentLength,
-      UserId: 'ezofis-user',
-      UserFriendlyName: 'ezofis user',
-      UserCanWrite: true,
-      HideUserList: true,
-      DisablePrint: false,
-      DisableExport: false,
-      HideSaveOption: true,
-      DownloadAsPostMessage: true,
-      LastModifiedTime: props.lastModified.toISOString(),
-      PostMessageOrigin: req.query.origin || '*',
-    });
-  } catch (err) {
-    if (err.statusCode === 404) return res.status(404).end();
-    console.error('CheckFileInfo failed', err);
-    res.status(500).end();
-  }
-});
+// -------------------------------------------------------------- upload
 
-// GetFile
-app.get('/wopi/files/:id/contents', requireToken, async (req, res) => {
-  try {
-    const download = await blobFor(req.params.id).download();
-    res.setHeader('Content-Type', download.contentType || 'application/octet-stream');
-    download.readableStreamBody.pipe(res);
-  } catch (err) {
-    if (err.statusCode === 404) return res.status(404).end();
-    console.error('GetFile failed', err);
-    res.status(500).end();
-  }
-});
+// app.post("/upload", upload.single("document"), async (req, res) => {
+//   if (!req.file) return res.status(400).json({ error: "No file uploaded." });
 
-// PutFile (save from Collabora)
-app.post(
-  '/wopi/files/:id/contents',
-  requireToken,
-  express.raw({ type: '*/*', limit: '100mb' }),
-  async (req, res) => {
+//   const id = String(fileCounter++);
+//   const token = crypto.randomUUID();
+//   const ext = path.extname(req.file.originalname).toLowerCase();
+//   const stem = path.basename(req.file.originalname, ext);
+
+//   if (ext !== ".pdf") {
+//     // Normal path - Collabora edits the uploaded file directly.
+//     fileRegistry[id] = {
+//       token,
+//       kind: "native",
+//       originalPath: req.file.path,
+//       originalName: req.file.originalname,
+//       editPath: req.file.path,
+//       editName: req.file.originalname,
+//     };
+//     return res.json({ fileId: id, token, mode: "native" });
+//   }
+
+//   // PDF path - convert to ODG so the text becomes editable Draw objects.
+//   try {
+//     const odg = await convertDocument(req.file.path, "odg");
+//     const editPath = path.join(WORK_DIR, `${id}.odg`);
+//     await fsp.writeFile(editPath, odg);
+
+//     fileRegistry[id] = {
+//       token,
+//       kind: "pdf-derived",
+//       originalPath: req.file.path,
+//       originalName: req.file.originalname,
+//       editPath,
+//       editName: `${stem}.odg`,
+//       outputPath: path.join(OUTPUT_DIR, `${id}.pdf`),
+//       dirty: false,
+//       converting: false,
+//       lastError: null,
+//     };
+
+//     // Seed the output with the untouched original so a download always works.
+//     await fsp.copyFile(req.file.path, fileRegistry[id].outputPath);
+
+//     res.json({ fileId: id, token, mode: "pdf-converted" });
+//   } catch (err) {
+//     console.error("[upload] PDF conversion failed:", err.message);
+//     res.status(502).json({
+//       error: "Could not convert this PDF for editing.",
+//       detail: err.message,
+//       hint: "Scanned PDFs have no text layer - run OCR first.",
+//     });
+//   }
+// });
+
+const REGEN_DEBOUNCE_MS = Number(process.env.REGEN_DEBOUNCE_MS || 2000);
+const regenTimers = new Map();
+ 
+async function regeneratePdf(entry) {
+  if (entry.kind !== "pdf-derived" || !entry.dirty) return;
+ 
+  return registry.withLock(entry, async () => {
+    if (!entry.dirty) return;          // another run got here first
+    entry.converting = true;
+    entry.dirty = false;               // clear before converting
+ 
     try {
-      const blob = blobFor(req.params.id);
-      const existing = await blob.getProperties().catch(() => null);
-      await blob.uploadData(req.body, {
-        blobHTTPHeaders: { blobContentType: existing?.contentType || 'application/octet-stream' },
-        metadata: existing?.metadata,
-      });
-      res.json({ LastModifiedTime: new Date().toISOString() });
+      const pdf = await convert(entry.editPath, "pdf");
+      const { version, filePath } = registry.nextVersionPath(entry);
+      await fsp.writeFile(filePath, pdf);
+      registry.recordVersion(entry, version, filePath);
+      entry.lastError = null;
+      console.log(`[regen] ${entry.id} -> v${version} (${pdf.length} bytes)`);
     } catch (err) {
-      console.error('PutFile failed', err);
-      res.status(500).end();
+      entry.lastError = err.message;
+      entry.dirty = true;              // restore so a retry can happen
+      console.error(`[regen] ${entry.id} failed:`, err.message);
+    } finally {
+      entry.converting = false;
     }
-  }
-);
+  });
+}
+ 
+function scheduleRegeneration(entry) {
+  clearTimeout(regenTimers.get(entry.id));
+  regenTimers.set(
+    entry.id,
+    setTimeout(() => {
+      regenTimers.delete(entry.id);
+      regeneratePdf(entry);
+    }, REGEN_DEBOUNCE_MS)
+  );
+}
 
-app.listen(PORT, () => {
-  console.log(`WOPI host listening on :${PORT}`);
-  console.log(`  Storage container: ${STORAGE_CONTAINER}`);
-  console.log(`  Collabora: ${COLLABORA_BASE_URL}`);
+app.post("/upload", upload.single("document"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded." });
+
+  const ext = path.extname(req.file.originalname).toLowerCase();
+  const isPdf = ext === ".pdf";
+
+  const entry = registry.create({
+    originalName: req.file.originalname,
+    kind: isPdf ? "pdf-derived" : "native",
+  });
+
+  try {
+    await fsp.rename(req.file.path, entry.originalPath);
+  } catch (err) {
+    // rename fails across drives - fall back to copy
+    await fsp.copyFile(req.file.path, entry.originalPath);
+    await fsp.unlink(req.file.path).catch(() => {});
+  }
+
+  if (!isPdf) {
+    console.log(`[upload] ${entry.id} native ${ext}`);
+    return res.json({
+      fileId: entry.id,
+      token: entry.token,
+      name: entry.displayName,
+      mode: "native",
+    });
+  }
+
+  // The ingested PDF is version 1 and is never overwritten.
+  registry.recordVersion(entry, 1, entry.originalPath);
+
+  try {
+   const odg = await registry.withLock(entry, () => convert(entry.originalPath, "odg:draw8"));
+    await fsp.writeFile(entry.editPath, odg);
+
+    console.log(`[upload] ${entry.id} converted to ODG (${odg.length} bytes)`);
+
+    res.json({
+      fileId: entry.id,
+      token: entry.token,
+      name: entry.displayName,
+      mode: "editable",
+      version: 1,
+    });
+  } catch (err) {
+    console.error(`[upload] ${entry.id} conversion failed:`, err.message);
+    entry.lastError = err.message;
+    entry.kind = "pdf-readonly";
+
+    res.status(200).json({
+      fileId: entry.id,
+      token: entry.token,
+      name: entry.displayName,
+      mode: "view-only",
+      version: 1,
+      notice: "This PDF could not be prepared for editing. It can be viewed and annotated.",
+    });
+  }
 });
+
+// ---------------------------------------------------------------- WOPI
+
+app.use("/wopi/files/:id/contents", express.raw({ type: "*/*", limit: "100mb" }));
+
+function authorize(req, res) {
+  const file = fileRegistry[req.params.id];
+  if (!file || req.query.access_token !== file.token) {
+    res.status(401).send("Invalid token");
+    return null;
+  }
+  if (!fs.existsSync(file.editPath)) {
+    res.status(404).send("File not found");
+    return null;
+  }
+  return file;
+}
+const REQUIRE_TOKEN = process.env.REQUIRE_TOKEN === "true";
+ 
+function requireFile(req, res) {
+  const entry = registry.get(req.params.id);
+ 
+  if (!entry) {
+    console.warn(`[wopi] unknown file id ${req.params.id}`);
+    res.status(404).send("Unknown file");
+    return null;
+  }
+  if (REQUIRE_TOKEN && entry.token !== req.query.access_token) {
+    console.warn(
+      `[wopi] token mismatch on ${entry.id}: got ${req.query.access_token?.length} chars, expected ${entry.token.length}`
+    );
+    res.status(401).send("Invalid token");
+    return null;
+  }
+  if (!fs.existsSync(entry.editPath)) {
+    res.status(404).send("File missing on disk");
+    return null;
+  }
+  return entry;
+}
+// 1. CheckFileInfo
+app.get("/wopi/files/:id", (req, res) => {
+  const entry = requireFile(req, res);
+  if (!entry) return;
+ 
+  const stat = fs.statSync(entry.editPath);
+  const readOnly = entry.kind === "pdf-readonly";
+ 
+  res.json({
+    // The extension here decides which editor Collabora loads.
+    // "sample.odg" -> Draw with editable text.
+    BaseFileName: entry.editName,
+    Size: stat.size,
+    Version: String(stat.mtimeMs),
+    LastModifiedTime: stat.mtime.toISOString(),
+ 
+    OwnerId: "ezofis",
+    UserId: "thanaselvi-local",
+    UserFriendlyName: "Thanaselvi",
+ 
+    UserCanWrite: !readOnly,
+    UserCanNotWriteRelative: true,
+    SupportsUpdate: !readOnly,
+    SupportsLocks: false,
+ 
+    HideUserList: true,
+    DisablePrint: true,
+    DisableExport: false,
+    HideSaveOption: false,
+    DisableInactiveMessages: true,
+    PostMessageOrigin: "*",
+  });
+});
+
+// 2. GetFile
+app.get("/wopi/files/:id/contents", (req, res) => {
+  const entry = requireFile(req, res);
+  if (!entry) return;
+  res.sendFile(entry.editPath);
+});
+
+// 3. PutFile
+app.post("/wopi/files/:id/contents", async (req, res) => {
+  const entry = requireFile(req, res);
+  if (!entry) return;
+ 
+  if (entry.kind === "pdf-readonly") return res.sendStatus(404);
+ 
+  if (!req.body || req.body.length === 0) {
+    console.warn(`[wopi] ${entry.id} empty PutFile body - refusing`);
+    return res.sendStatus(400);
+  }
+ 
+  try {
+    await registry.withLock(entry, () => fsp.writeFile(entry.editPath, req.body));
+    console.log(`[wopi] ${entry.id} saved ${entry.editName} (${req.body.length} bytes)`);
+ 
+    if (entry.kind === "pdf-derived") entry.dirty = true ; scheduleRegeneration(entry);
+ 
+    res.sendStatus(200);
+  } catch (err) {
+    console.error(`[wopi] ${entry.id} PutFile failed:`, err.message);
+    res.sendStatus(500);
+  }
+});
+
+async function flushPdf(entry) {
+  clearTimeout(regenTimers.get(entry.id));
+  regenTimers.delete(entry.id);
+  await regeneratePdf(entry);
+  return registry.latestVersion(entry);
+}
+
+
+
+app.get("/files/:id/pdf", async (req, res) => {
+  const entry = registry.get(req.params.id);
+  if (!entry) return res.status(404).json({ error: "Unknown file" });
+ 
+  const latest = await flushPdf(entry);
+  if (!latest) return res.status(500).json({ error: entry.lastError || "No PDF available" });
+ 
+  res.download(latest.filePath, entry.displayName);
+});
+ 
+app.get("/files/:id/pdf-base64", async (req, res) => {
+  const entry = registry.get(req.params.id);
+  if (!entry) return res.status(404).json({ error: "Unknown file" });
+ 
+  const latest = await flushPdf(entry);
+  if (!latest) return res.status(500).json({ error: entry.lastError || "No PDF available" });
+ 
+  const buffer = await fsp.readFile(latest.filePath);
+ 
+  res.json({
+    fileId: entry.id,
+    name: entry.displayName,
+    version: latest.version,
+    createdAt: latest.createdAt,
+    mimeType: "application/pdf",
+    size: buffer.length,
+    base64: buffer.toString("base64"),
+  });
+});
+app.get("/files/:id/versions", (req, res) => {
+  const entry = registry.get(req.params.id);
+  if (!entry) return res.status(404).json({ error: "Unknown file" });
+ 
+  res.json({
+    name: entry.displayName,
+    dirty: entry.dirty,
+    converting: entry.converting,
+    error: entry.lastError,
+    versions: entry.versions.map((v) => ({ version: v.version, createdAt: v.createdAt })),
+  });
+});
+// ------------------------------------------------- app-facing endpoints
+
+// Poll this after a save to know when the PDF is ready.
+app.get("/files/:id/status", (req, res) => {
+  const file = fileRegistry[req.params.id];
+  if (!file) return res.status(404).json({ error: "Unknown file" });
+
+  res.json({
+    kind: file.kind,
+    dirty: !!file.dirty,
+    converting: !!file.converting,
+    updatedAt: file.updatedAt || null,
+    error: file.lastError || null,
+  });
+});
+
+// Download the current PDF. Forces a conversion first if edits are pending.
+app.get("/files/:id/pdf", async (req, res) => {
+  const file = fileRegistry[req.params.id];
+  if (!file) return res.status(404).send("Unknown file");
+  if (file.kind !== "pdf-derived") return res.status(400).send("Not a PDF-derived file");
+
+  if (file.dirty || file.converting) {
+    clearTimeout(saveTimers.get(req.params.id));
+    saveTimers.delete(req.params.id);
+    await regeneratePdf(req.params.id);
+  }
+
+  if (file.lastError) {
+    return res.status(502).json({ error: "Conversion failed", detail: file.lastError });
+  }
+
+  res.download(file.outputPath, file.originalName);
+});
+
+// The untouched upload, for version history / rollback.
+app.get("/files/:id/original", (req, res) => {
+  const file = fileRegistry[req.params.id];
+  if (!file) return res.status(404).send("Unknown file");
+  res.download(file.originalPath, file.originalName);
+});
+
+// ---------------------------------------------------------------- boot
+
+async function checkCollabora() {
+  try {
+    const res = await fetch(`${COLLABORA_URL}/hosting/capabilities`);
+    const caps = await res.json();
+    const ok = caps?.convert_to?.available ?? caps?.["convert-to"]?.available;
+    console.log(
+      ok
+        ? "[startup] Collabora conversion API is available."
+        : "[startup] WARNING: conversion API unavailable - check net.post_allow in coolwsd.xml."
+    );
+  } catch (err) {
+    console.error(`[startup] Cannot reach Collabora at ${COLLABORA_URL}:`, err.message);
+  }
+}
+
+// app.get("/test-convert", async (req, res) => {
+//   try {
+//     const buf = await convert("C:\\Users\\Shiva\\test\\sample.pdf", "odg");
+//     await require("fs/promises").writeFile("C:\\Users\\Shiva\\test\\out.odg", buf);
+//     res.send(`OK - ${buf.length} bytes`);
+//   } catch (err) {
+//     res.status(500).send(err.message);
+//   }
+// });
+
+const registry = require("./lib/registry");
+
+// app.get("/test-registry", async (req, res) => {
+//   const entry = registry.create({ originalName: "invoice.pdf", kind: "pdf-derived" });
+
+//   const order = [];
+//   const slow = (n, ms) => registry.withLock(entry, () =>
+//     new Promise((r) => setTimeout(() => { order.push(n); r(); }, ms))
+//   );
+
+//   await Promise.all([slow("first", 300), slow("second", 50), slow("third", 10)]);
+
+//   res.json({
+//     editName: entry.editName,
+//     editPath: entry.editPath,
+//     originalPath: entry.originalPath,
+//     lockOrder: order,
+//   });
+// });
+app.get("/health", (_req, res) => res.send("ok"));
+app.listen(PORT, "0.0.0.0", async () => {
+    console.log(`WOPI host running on port ${PORT}`);
+    await checkCollabora();
+  });
